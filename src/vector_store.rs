@@ -454,17 +454,13 @@ fn preprocess_embedding(
     hnsw_index: &HNSWIndex,
     quantization_metric: &RwLock<QuantizationMetric>,
     raw_emb: &RawDenseVectorEmbedding,
-) -> Vec<IndexableEmbedding> {
+) -> Result<Vec<IndexableEmbedding>, WaCustomError> {
     let quantization = quantization_metric.read().unwrap();
-    let quantized_vec = Arc::new(
-        quantization
-            .quantize(
-                &raw_emb.raw_vec,
-                *hnsw_index.storage_type.read().unwrap(),
-                *hnsw_index.values_range.read().unwrap(),
-            )
-            .expect("Quantization failed"),
-    );
+    let quantized_vec = Arc::new(quantization.quantize(
+        &raw_emb.raw_vec,
+        *hnsw_index.storage_type.read().unwrap(),
+        *hnsw_index.values_range.read().unwrap(),
+    )?);
 
     // Write props to the prop file
     let mut prop_file_guard = hnsw_index.cache.prop_file.write().unwrap();
@@ -488,9 +484,8 @@ fn preprocess_embedding(
     let metadata_schema = collection.meta.metadata_schema.as_ref();
     let prop_file = &hnsw_index.cache.prop_file;
 
-    // @TODO(vineet): Remove unwraps
-    if raw_emb.is_pseudo {
-        let replicas = pseudo_metadata_replicas(metadata_schema.unwrap(), prop_file).unwrap();
+    let embeddins = if raw_emb.is_pseudo {
+        let replicas = pseudo_metadata_replicas(metadata_schema.unwrap(), prop_file)?;
         // @TODO(vineet): This is hacky
         let num_levels = hnsw_index.levels_prob.len() - 1;
         let plp = pseudo_level_probs(num_levels as u8, replicas.len() as u16);
@@ -505,9 +500,15 @@ fn preprocess_embedding(
             } else {
                 plp.clone()
             };
+            let id = InternalId::from(*base_id + replica_id as u32 + 1);
+            let mut prop_file_guard = hnsw_index.cache.prop_file.write().unwrap();
+            let location =
+                write_prop_value_to_file(&raw_emb.hash_vec, &quantized_vec, &mut prop_file_guard)
+                    .expect("failed to write prop");
+            drop(prop_file_guard);
             let emb = IndexableEmbedding {
                 prop_value: Arc::new(NodePropValue {
-                    id: InternalId::from(*base_id + replica_id as u32 + 1),
+                    id,
                     vec: quantized_vec.clone(),
                     location,
                 }),
@@ -522,15 +523,23 @@ fn preprocess_embedding(
             collection.meta.metadata_schema.as_ref(),
             raw_emb.raw_metadata.as_ref(),
             &hnsw_index.cache.prop_file,
-        )
-        .unwrap();
+        )?;
         match metadata_replicas {
             Some(replicas) => {
                 let mut embeddings: Vec<IndexableEmbedding> = vec![];
                 for (replica_id, prop_metadata) in replicas.into_iter().enumerate() {
+                    let id = InternalId::from(*base_id + replica_id as u32 + 1);
+                    let mut prop_file_guard = hnsw_index.cache.prop_file.write().unwrap();
+                    let location = write_prop_value_to_file(
+                        &raw_emb.hash_vec,
+                        &quantized_vec,
+                        &mut prop_file_guard,
+                    )
+                    .expect("failed to write prop");
+                    drop(prop_file_guard);
                     let emb = IndexableEmbedding {
                         prop_value: Arc::new(NodePropValue {
-                            id: InternalId::from(*base_id + replica_id as u32 + 1),
+                            id,
                             vec: quantized_vec.clone(),
                             location,
                         }),
@@ -550,7 +559,9 @@ fn preprocess_embedding(
                 vec![emb]
             }
         }
-    }
+    };
+
+    Ok(embeddins)
 }
 
 pub fn index_embeddings(
@@ -572,7 +583,7 @@ pub fn index_embeddings(
                 is_pseudo,
             }
         })
-        .flat_map(|emb| {
+        .map(|emb| {
             preprocess_embedding(
                 collection,
                 hnsw_index,
@@ -580,7 +591,10 @@ pub fn index_embeddings(
                 &emb,
             )
         })
-        .collect::<Vec<IndexableEmbedding>>();
+        .collect::<Result<Vec<Vec<IndexableEmbedding>>, WaCustomError>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
 
     let offset_counter = hnsw_index.offset_counter.read().unwrap();
     let file_id = offset_counter.file_id();
