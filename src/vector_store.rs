@@ -749,10 +749,7 @@ pub fn index_embedding(
         let node = unsafe { &*lazy_node }.get_lazy_data().unwrap();
 
         if let Some(parent) = unsafe { parent.as_ref() } {
-            parent
-                .try_get_data(&hnsw_index.cache)
-                .unwrap()
-                .set_child(lazy_node);
+            parent.try_get_data(&hnsw_index.cache)?.set_child(lazy_node);
         }
 
         if cur_level.0 != 0 {
